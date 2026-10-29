@@ -1,0 +1,232 @@
+name: Deploy develop
+
+# Deploys develop to the sandbox VM (k3s, namespace `develop`, release `sandbox`)
+# with the latest oan-sandbox chart from the oan-helm Helm repository.
+#
+# - Push to develop: run CI, build the API and web images here, load them into
+#   the VM's k3s containerd (no registry; the chart uses pullPolicy Never) and
+#   `helm upgrade` to the latest chart.
+# - Schedule / manual run: pick up a newer oan-helm chart release. Images are
+#   built only when the develop commit has no image on the VM yet.
+#
+# Builds run on the GitHub runner, not on the VM: building the web image on the
+# 4 GB VM next to Rancher made it swap until the Kubernetes API stalled.
+#
+# Postgres, the Ingress and the `sandbox-secrets` Secret stay as the Ansible
+# playbook created them; this workflow changes only the chart and the images.
+#
+# Secrets (environment `develop`):
+#   SANDBOX_VM_HOST         VM address, e.g. 13.233.3.96
+#   SANDBOX_VM_USER         SSH user with passwordless sudo, e.g. ubuntu
+#   SANDBOX_VM_SSH_KEY      private key for that user
+#   SANDBOX_VM_KNOWN_HOSTS  output of `ssh-keyscan -t ed25519 <host>`
+
+on:
+  push:
+    branches: [develop]
+  # Schedule and manual runs need this file on the default branch (main).
+  schedule:
+    - cron: "30 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      chart_version:
+        description: oan-sandbox chart version (empty = latest, including -dev)
+        required: false
+        default: ""
+      force_build:
+        description: Rebuild the images even if the VM already has them
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-develop
+  cancel-in-progress: false
+
+env:
+  NAMESPACE: develop
+  RELEASE: sandbox
+  SANDBOX_HOSTNAME: sandbox.development.oanstaging.com
+  HELM_REPO_URL: https://raw.githubusercontent.com/Centre-for-Open-Societal-Systems/oan-helm/main/repository/
+  CHART: oan-sandbox
+  IMAGE_PREFIX: oan-sandbox
+  COUNTRY_CODE: ET
+  SITE_NAME: Open Agri Net
+
+jobs:
+  ci:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    # Run when CI passed, or was skipped because this is not a push.
+    if: always() && (needs.ci.result == 'success' || needs.ci.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment:
+      name: develop
+      url: https://${{ env.SANDBOX_HOSTNAME }}
+    env:
+      KUBECONFIG_VM: /etc/rancher/k3s/k3s.yaml
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Scheduled runs start from main; always deploy develop.
+          ref: ${{ github.event_name == 'push' && github.sha || 'develop' }}
+
+      - name: SSH to the VM
+        env:
+          VM_HOST: ${{ secrets.SANDBOX_VM_HOST }}
+          VM_USER: ${{ secrets.SANDBOX_VM_USER }}
+          VM_SSH_KEY: ${{ secrets.SANDBOX_VM_SSH_KEY }}
+          VM_KNOWN_HOSTS: ${{ secrets.SANDBOX_VM_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/id_vm
+          printf '%s\n' "$VM_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_vm ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host vm
+            HostName $VM_HOST
+            User $VM_USER
+            IdentityFile ~/.ssh/id_vm
+            StrictHostKeyChecking yes
+            ServerAliveInterval 30
+          EOF
+          ssh vm true
+
+      # Same tags as the Ansible images role, so either can deploy what the other built.
+      - name: Image tags and chart version
+        id: meta
+        env:
+          CHART_VERSION_INPUT: ${{ inputs.chart_version }}
+        run: |
+          sha=$(git rev-parse HEAD | cut -c1-12)
+          api_url="https://${SANDBOX_HOSTNAME}/oan"
+          # The browser API URL is built into the web image: include it in the tag.
+          url_hash=$(printf '%s' "$api_url" | md5sum | cut -c1-6)
+
+          helm repo add oan "$HELM_REPO_URL" >/dev/null
+          helm repo update oan >/dev/null
+          version=${CHART_VERSION_INPUT:-$(helm search repo "oan/$CHART" --devel -o json | jq -r '.[0].version')}
+          helm show chart "oan/$CHART" --version "$version" >/dev/null   # fails on an unknown version
+
+          {
+            echo "api_url=$api_url"
+            echo "api_tag=$sha"
+            echo "web_tag=$sha-$url_hash"
+            echo "chart_version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "Deploying $IMAGE_PREFIX-api:$sha, $IMAGE_PREFIX-web:$sha-$url_hash with $CHART $version" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Images already on the VM
+        id: present
+        env:
+          API_IMAGE: ${{ env.IMAGE_PREFIX }}-api:${{ steps.meta.outputs.api_tag }}
+          WEB_IMAGE: ${{ env.IMAGE_PREFIX }}-web:${{ steps.meta.outputs.web_tag }}
+        run: |
+          images=$(ssh vm 'sudo k3s ctr -n k8s.io images ls -q')
+          for kind in api web; do
+            var=${kind^^}_IMAGE
+            if [[ "${{ inputs.force_build }}" != "true" ]] && grep -qE "(^|/)${!var}\$" <<<"$images"; then
+              echo "$kind=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$kind=false" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.present.outputs.api != 'true' || steps.present.outputs.web != 'true'
+
+      - name: Build the API image
+        if: steps.present.outputs.api != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/sandbox-api/Dockerfile
+          tags: ${{ env.IMAGE_PREFIX }}-api:${{ steps.meta.outputs.api_tag }}
+          load: true
+          cache-from: type=gha,scope=sandbox-api
+          cache-to: type=gha,scope=sandbox-api,mode=max
+
+      - name: Build the web image
+        if: steps.present.outputs.web != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ui
+          tags: ${{ env.IMAGE_PREFIX }}-web:${{ steps.meta.outputs.web_tag }}
+          build-args: |
+            NEXT_PUBLIC_API_BASE_URL=${{ steps.meta.outputs.api_url }}
+            NEXT_PUBLIC_DEFAULT_COUNTRY=${{ env.COUNTRY_CODE }}
+            NEXT_PUBLIC_SITE_NAME=${{ env.SITE_NAME }}
+          load: true
+          cache-from: type=gha,scope=sandbox-web
+          cache-to: type=gha,scope=sandbox-web,mode=max
+
+      - name: Load the images into k3s
+        run: |
+          for image in \
+            ${{ steps.present.outputs.api != 'true' && format('{0}-api:{1}', env.IMAGE_PREFIX, steps.meta.outputs.api_tag) || '' }} \
+            ${{ steps.present.outputs.web != 'true' && format('{0}-web:{1}', env.IMAGE_PREFIX, steps.meta.outputs.web_tag) || '' }}; do
+            echo "Loading $image"
+            docker save "$image" | gzip -1 | ssh vm 'gunzip | sudo k3s ctr -n k8s.io images import -'
+          done
+
+      # --reset-then-reuse-values keeps the values the playbook set (DB, gateway,
+      # Secret name, virtualService off) on top of the new chart's defaults.
+      - name: helm upgrade
+        env:
+          CHART_VERSION: ${{ steps.meta.outputs.chart_version }}
+          API_TAG: ${{ steps.meta.outputs.api_tag }}
+          WEB_TAG: ${{ steps.meta.outputs.web_tag }}
+        run: |
+          ssh vm sudo env \
+            KUBECONFIG="$KUBECONFIG_VM" NAMESPACE="$NAMESPACE" RELEASE="$RELEASE" \
+            HELM_REPO_URL="$HELM_REPO_URL" CHART="$CHART" CHART_VERSION="$CHART_VERSION" \
+            IMAGE_PREFIX="$IMAGE_PREFIX" API_TAG="$API_TAG" WEB_TAG="$WEB_TAG" \
+            bash -s <<'EOF'
+          set -euo pipefail
+          helm repo add oan "$HELM_REPO_URL" --force-update >/dev/null
+          helm repo update oan >/dev/null
+          echo "Before: $(helm -n "$NAMESPACE" list -f "^$RELEASE\$" -o json | jq -r '.[0].chart')"
+          helm upgrade "$RELEASE" "oan/$CHART" --version "$CHART_VERSION" \
+            -n "$NAMESPACE" --reset-then-reuse-values \
+            --set api.image.repository="$IMAGE_PREFIX-api" --set-string api.image.tag="$API_TAG" \
+            --set api.image.pullPolicy=Never \
+            --set web.image.repository="$IMAGE_PREFIX-web" --set-string web.image.tag="$WEB_TAG" \
+            --set web.image.pullPolicy=Never \
+            --atomic --wait --timeout 15m
+          helm -n "$NAMESPACE" list -f "^$RELEASE\$"
+          EOF
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 30); do
+            if body=$(curl -fsS "https://${SANDBOX_HOSTNAME}/oan/health"); then
+              echo "$body"
+              echo "Health: \`$body\`" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::https://${SANDBOX_HOSTNAME}/oan/health did not return 200"
+          exit 1
+
+      # Keep the sandbox images of the last two deployed revisions (so
+      # `helm rollback` still works with pullPolicy Never) and remove the rest.
+      - name: Remove old sandbox images from k3s
+        run: |
+          ssh vm sudo env KUBECONFIG="$KUBECONFIG_VM" NAMESPACE="$NAMESPACE" RELEASE="$RELEASE" \
+            IMAGE_PREFIX="$IMAGE_PREFIX" bash -s <<'EOF' || echo "::warning::image cleanup failed"
+          set -euo pipefail
+          keep=$(for rev in $(helm -n "$NAMESPACE" history "$RELEASE" -o json \
+                   | jq -r '[.[] | select(.status == "deployed" or .status == "superseded")][-2:][].revision'); do
+                   helm -n "$NAMESPACE" get values "$RELEASE" --revision "$rev" -o json \
+                     | jq -r '.api.image.repository + ":" + .api.image.tag, .web.image.repository + ":" + .web.image.tag'
+                 done)
+          k3s ctr -n k8s.io images ls -q | grep -E "(^|/)$IMAGE_PREFIX-(api|web):" | while read -r ref; do
+            grep -qxF "${ref#docker.io/library/}" <<<"$keep" || { echo "Removing $ref"; k3s ctr -n k8s.io images rm "$ref"; }
+          done
+          EOF

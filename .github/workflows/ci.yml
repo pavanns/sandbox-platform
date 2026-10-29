@@ -2,12 +2,14 @@ name: CI
 
 # Checks every push and pull request: backend lint + tests, UI type-check,
 # lint and build, and both Docker images build. Nothing is published.
+# Pushes to develop run it through deploy-develop.yml, which deploys after it.
 
 on:
   push:
-    branches: ["main", "staging", "develop"]
+    branches: ["main", "staging"]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   backend:
