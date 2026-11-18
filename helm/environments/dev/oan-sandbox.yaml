@@ -27,15 +27,15 @@ config:
     uatUrl: https://partner-api.development.oanstaging.com
     sync:
       # oauth only reads the routes: GATEWAY_ADMIN_TOKEN in the Secret is the viewer key
-      # (Secret apisix-admin-credentials, key viewer, namespace apisix).
-      # Dev APISIX's own Admin Service on oan_dev (release apisix, namespace apisix; not
-      # staging's https://apisix-admin.oanstaging.com, which this cluster cannot reach).
+      # (Secret apisix-admin-credentials, key viewer, namespace api6-gateway).
+      # Dev APISIX's own Admin Service on oan_dev (Service apisix-admin, namespace api6-gateway;
+      # not staging's https://apisix-admin.oanstaging.com, which this cluster cannot reach).
       # The Admin API admits by source IP: the API Pod comes from the k3s Pod CIDR
       # (10.42.0.0/16), which the 10.0.0.0/8 entry of apisix.admin.allow in oan-helm
       # environments/dev/values/apisix.yaml covers.
       enabled: true
       type: apisix
-      adminUrl: http://apisix-admin.apisix.svc.cluster.local:9180
+      adminUrl: http://apisix-admin.api6-gateway.svc.cluster.local:9180
     appSync:
       enabled: true
     # Partners call with an app access token (client credentials), not the API key.
